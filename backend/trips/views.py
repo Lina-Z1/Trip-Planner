@@ -9,7 +9,7 @@ from django.views.decorators.http import require_POST
 from .geo import geocode, get_route, Path, Places
 from .hos import plan, build_logs
 
- 
+# Log header fields from the paper template; blanks become "N/A" as on the sample log.
 HEADER_FIELDS = ("carrier", "main_office", "home_terminal", "vehicles", "driver",
                  "co_driver", "shipper", "commodity", "load_number")
 
@@ -19,7 +19,7 @@ def health(request):
 
 
 def index(request):
-    return JsonResponse({"service": "Trip Planner API", "endpoints": ["/api/plan/", "/api/health/"]})
+    return JsonResponse({"service": "ELD Trip Planner API", "endpoints": ["/api/plan/", "/api/health/"]})
 
 
 @csrf_exempt
@@ -61,5 +61,8 @@ def plan_trip(request):
                 "drive_hours": round(sum(l["totals"]["D"] for l in logs), 1),
             },
         })
-    except (ValueError, KeyError, TypeError, requests.RequestException) as e:
+    except requests.RequestException:
+        # Public map servers can be busy or rate-limited; give a friendly message, not a raw URL.
+        return JsonResponse({"error": "The free map service is busy right now. Please wait a minute and try again."}, status=503)
+    except (ValueError, KeyError, TypeError) as e:
         return JsonResponse({"error": str(e) or "Invalid request."}, status=400)
