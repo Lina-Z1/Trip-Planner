@@ -9,8 +9,8 @@
 
 A full-stack app (Django + React) that takes a trip and returns a **route map with stops and rests** plus **filled-in ELD daily log sheets**, following US hours-of-service (HOS) rules for a property-carrying driver on a 70-hour / 8-day cycle.
 
-- **Live app:** _add Vercel link_
-- **API:** _add Render/Railway link_
+- **Live app:**  [Visit Website]( https://trip-planner-project.netlify.app/)
+- **API:**  [_View API](https://trip-planner-project-vfib.onrender.com/)
  
 
  
