@@ -1,42 +1,94 @@
-"""Geocoding (Nominatim) and routing (OSRM). Both are free and need no API key."""
+"""Geocoding, reverse geocoding and routing, all free and keyless.
+Nominatim and OSRM are public shared servers: they answer 429 ("too many requests") when many apps
+share one hosting IP, so every call retries briefly, geocoding falls back to Photon (also free),
+and results are cached."""
 import bisect
 import math
+import os
 import time
 import requests
 
-HEADERS = {"User-Agent": "eld-trip-planner/1.0 (assessment project)"}  # Nominatim requires this
+# Nominatim's policy asks for a User-Agent that identifies the app. Set GEOCODER_CONTACT on the
+# host to your email or GitHub URL; a unique value makes you much less likely to be rate-limited.
+HEADERS = {"User-Agent": f"eld-trip-planner/1.0 ({os.environ.get('GEOCODER_CONTACT', 'assessment project')})"}
+NOMINATIM = "https://nominatim.openstreetmap.org"
+PHOTON = "https://photon.komoot.io"
+OSRM = "https://router.project-osrm.org/route/v1/driving"
+
+US_STATES = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR", "California": "CA", "Colorado": "CO",
+    "Connecticut": "CT", "Delaware": "DE", "Florida": "FL", "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID",
+    "Illinois": "IL", "Indiana": "IN", "Iowa": "IA", "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA",
+    "Maine": "ME", "Maryland": "MD", "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN",
+    "Mississippi": "MS", "Missouri": "MO", "Montana": "MT", "Nebraska": "NE", "Nevada": "NV",
+    "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY", "North Carolina": "NC",
+    "North Dakota": "ND", "Ohio": "OH", "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA",
+    "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX",
+    "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY", "District of Columbia": "DC",
+}
+
+
+def _get(url, params, retries=2):
+    """GET JSON; if the public server says 429/503, wait a little and try again."""
+    for attempt in range(retries + 1):
+        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        if r.status_code in (429, 503) and attempt < retries:
+            time.sleep(2 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        return r.json()
+
+
+_GEO = {}  # typed text -> (lat, lon); repeat searches never hit the servers again
 
 
 def geocode(query):
-    """Turn free text ('Dallas, TX') into (lat, lon)."""
-    r = requests.get("https://nominatim.openstreetmap.org/search",
-                     params={"q": query, "format": "json", "limit": 1}, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        raise ValueError(f"Could not find a location for '{query}'.")
-    return float(data[0]["lat"]), float(data[0]["lon"])
+    """Turn free text ('Dallas, TX') into (lat, lon): Nominatim first, Photon as a fallback."""
+    key = query.strip().lower()
+    if key in _GEO:
+        return _GEO[key]
+    found = None
+    try:
+        data = _get(f"{NOMINATIM}/search", {"q": query, "format": "json", "limit": 1})
+        if data:
+            found = (float(data[0]["lat"]), float(data[0]["lon"]))
+    except requests.RequestException:
+        pass
+    if found is None:
+        try:
+            feats = _get(f"{PHOTON}/api/", {"q": query, "limit": 1}).get("features", [])
+            if feats:
+                lon, lat = feats[0]["geometry"]["coordinates"]   # GeoJSON order is lon, lat
+                found = (lat, lon)
+        except requests.RequestException:
+            pass
+    if found is None:
+        raise ValueError(f"Could not find '{query}'. Check the spelling (use 'City, ST') or try again in a minute.")
+    _GEO[key] = found
+    return found
 
 
 def reverse_geocode(lat, lon):
     """Turn coordinates into 'City, ST' (what the Remarks section of a log requires)."""
-    r = requests.get("https://nominatim.openstreetmap.org/reverse",
-                     params={"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 10, "addressdetails": 1},
-                     headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    a = r.json().get("address", {})
-    city = a.get("city") or a.get("town") or a.get("village") or a.get("hamlet") or a.get("municipality") or a.get("county")
-    state = (a.get("ISO3166-2-lvl4") or "").split("-")[-1] or a.get("state")  # 'US-IL' -> 'IL'
+    try:
+        a = _get(f"{NOMINATIM}/reverse", {"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 10, "addressdetails": 1}).get("address", {})
+        city = a.get("city") or a.get("town") or a.get("village") or a.get("hamlet") or a.get("municipality") or a.get("county")
+        state = (a.get("ISO3166-2-lvl4") or "").split("-")[-1] or a.get("state")   # 'US-IL' -> 'IL'
+    except requests.RequestException:
+        try:                                                      # fallback: Photon
+            p = _get(f"{PHOTON}/reverse", {"lat": lat, "lon": lon}).get("features", [{}])[0].get("properties", {})
+        except (requests.RequestException, IndexError):
+            return None
+        city = p.get("city") or p.get("town") or p.get("village") or p.get("county")
+        state = US_STATES.get(p.get("state"), p.get("state"))
     return ", ".join(x for x in (city, state) if x) or None
 
 
 def get_route(points):
     """Route through [(lat, lon), ...]. Returns (polyline, [leg_miles, ...])."""
     coords = ";".join(f"{lon},{lat}" for lat, lon in points)  # OSRM wants lon,lat
-    r = requests.get(f"https://router.project-osrm.org/route/v1/driving/{coords}",
-                     params={"overview": "simplified", "geometries": "geojson"}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    data = _get(f"{OSRM}/{coords}", {"overview": "simplified", "geometries": "geojson"})
     if data.get("code") != "Ok":
         raise ValueError("No drivable route found between those locations.")
     route = data["routes"][0]
